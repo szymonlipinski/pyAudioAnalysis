@@ -748,7 +748,10 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
     numOfWindows = MidTermFeatures.shape[1]
 
     # remove outliers:
-    DistancesAll = getAllDistances(MidTermFeaturesNorm)
+    MidTermFeaturesNormTLen = len(MidTermFeaturesNorm.T)
+    DistancesAll = numpy.zeros(MidTermFeaturesNormTLen)
+    for curMidIdx, midFeat in enumerate(MidTermFeaturesNorm.T):
+        DistancesAll[curMidIdx] = numpy.sum(distance.cdist([midFeat], MidTermFeaturesNorm.T))
     MDistancesAll = numpy.mean(DistancesAll)
     iNonOutLiers = numpy.nonzero(DistancesAll < 1.2 * MDistancesAll)[0]
 
@@ -825,10 +828,10 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
     silAll = []
     centersAll = []
     
-    for iSpeakers in sRange:        
+    for iSpeakers in sRange:
         k_means = sklearn.cluster.KMeans(n_clusters = iSpeakers)
         k_means.fit(MidTermFeaturesNorm.T)
-        cls = k_means.labels_        
+        cls = k_means.labels_
         means = k_means.cluster_centers_
 
         # Y = distance.squareform(distance.pdist(MidTermFeaturesNorm.T))
@@ -842,24 +845,37 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
                 silB.append(0.0)
             else:
                 MidTermFeaturesNormTemp = MidTermFeaturesNorm[:,cls==c]            # get subset of feature vectors
-                Yt = distance.pdist(MidTermFeaturesNormTemp.T)                # compute average distance between samples that belong to the cluster (a values)
-                silA.append(numpy.mean(Yt)*clusterPerCent)
+                MidTermLen = len(MidTermFeaturesNormTemp.T)
+                pDistSum = 0
+                for midFeat in MidTermFeaturesNormTemp.T:
+                    pDistSum = pDistSum + numpy.mean(distance.cdist([midFeat], MidTermFeaturesNormTemp.T))
+                silA.append(pDistSum * clusterPerCent/MidTermLen)
+
+                #Yt = pdist_func(MidTermFeaturesNormTemp.T)                # compute average distance between samples that belong to the cluster (a values)
+                #silA.append(numpy.mean(Yt)*clusterPerCent)
                 silBs = []
                 for c2 in range(iSpeakers):                        # compute distances from samples of other clusters
                     if c2!=c:
                         clusterPerCent2 = numpy.nonzero(cls==c2)[0].shape[0] / float(len(cls))
                         MidTermFeaturesNormTemp2 = MidTermFeaturesNorm[:,cls==c2]
-                        Yt = distance.cdist(MidTermFeaturesNormTemp.T, MidTermFeaturesNormTemp2.T)
-                        silBs.append(numpy.mean(Yt)*(clusterPerCent+clusterPerCent2)/2.0)
-                silBs = numpy.array(silBs)                            
+                        featSum = 0
+                        #Yt=numpy.zeros(MidTermLen)
+                        for midFeature in MidTermFeaturesNormTemp.T:
+                            featSum = featSum + numpy.mean(distance.cdist([midFeature], MidTermFeaturesNormTemp2.T))
+                        featSum = featSum / MidTermLen;
+                        silBs.append(featSum*(clusterPerCent+clusterPerCent2)/2.0)#
+                        #Yt, index = kdetree.query(MidTermFeaturesNormTemp2.T, k=70)
+                        #Yt = distance.cdist(MidTermFeaturesNormTemp.T, MidTermFeaturesNormTemp2.T)
+                        #silBs.append(numpy.mean(Yt)*(clusterPerCent+clusterPerCent2)/2.0)
+                silBs = numpy.array(silBs)
                 silB.append(min(silBs))                            # ... and keep the minimum value (i.e. the distance from the "nearest" cluster)
-        silA = numpy.array(silA); 
-        silB = numpy.array(silB); 
+        silA = numpy.array(silA);
+        silB = numpy.array(silB);
         sil = []
         for c in range(iSpeakers):                                # for each cluster (speaker)
             sil.append( ( silB[c] - silA[c]) / (max(silB[c],  silA[c])+0.00001)  )        # compute silhouette
 
-        silAll.append(numpy.mean(sil))                                # keep the AVERAGE SILLOUETTE
+        silAll.append(numpy.mean(sil))   # keep the AVERAGE SILLOUETTE
 
     #silAll = silAll * (1.0/(numpy.power(numpy.array(sRange),0.5)))
     imax = numpy.argmax(silAll)                                    # position of the maximum sillouette value
