@@ -587,6 +587,71 @@ def evaluateSegmentationClassificationDir(dirName, modelName, methodName):
     print "Min Accuracy: {0:.1f}".format(100.0*numpy.array(accuracys).min())
     print "Max Accuracy: {0:.1f}".format(100.0*numpy.array(accuracys).max())
 
+def nonSilenceIdx(x, Fs, stWin, stStep, smoothWindow=0.5, Weight=0.5, minPercent=1, plot=False):
+    '''
+    Event Detection (silence removal)
+    ARGUMENTS:
+         - x:                the input audio signal
+         - Fs:               sampling freq
+         - stWin, stStep:    window size and step in seconds
+         - smoothWindow:     (optinal) smooth window (in seconds)
+         - Weight:           (optinal) weight factor (0 < Weight < 1) the higher, the more strict
+         - plot:             (optinal) True if results are to be plotted
+    RETURNS:
+         - segmentLimits:    list of segment limits in seconds (e.g [[0.1, 0.9], [1.4, 3.0]] means that
+                    the resulting segments are (0.1 - 0.9) seconds and (1.4, 3.0) seconds
+    '''
+
+    if Weight >= 1:
+        Weight = 0.99
+    if Weight <= 0:
+        Weight = 0.01
+
+    # Step 1: feature extraction
+    ShortTermFeatures = aF.stFeatureExtraction(x, Fs, stWin * Fs, stStep * Fs)        # extract short-term features
+    iFeaturesSelect = [1, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]                           # SET 1A
+
+    # Step 2: train binary SVM classifier of low vs high energy frames
+    EnergySt = ShortTermFeatures[1, :]                  # keep only the energy short-term sequence (2nd feature)
+    E = numpy.sort(EnergySt)                            # sort the energy feature values:
+    L1 = int(len(E)*minPercent / 100)                               # number of 10% of the total short-term windows
+    NormalE = E[-L1:-1]
+    T1 = numpy.mean(E[0:L1]) + 0.000000000000001                 # compute "lower" 10% energy threshold
+    #T2 = numpy.mean(E[-L1:-1]) + 0.000000000000001                # compute "higher" 10% energy threshold
+    T2 = numpy.mean(NormalE) + 0.000000000000001                # compute "higher" 10% energy threshold
+
+    #ShortTermFeatures[1, :] = 20*numpy.log10(ShortTermFeatures[1, :])
+    ShortTermFeatures = ShortTermFeatures[iFeaturesSelect, :]
+    Class1 = ShortTermFeatures[:, numpy.where(EnergySt <= T1)[0]]         # get all features that correspond to low energy
+    Class2 = ShortTermFeatures[:, numpy.where(EnergySt >= T2)[0]]         # get all features that correspond to high energy
+
+    featuresSS = [Class1.T, Class2.T]                                    # form the binary classification task and ...
+
+    [featuresNormSS, MEANSS, STDSS] = aT.normalizeFeatures(featuresSS)   # normalize and ...
+    SVM = aT.trainSVM(featuresNormSS, 1.0)                               # train the respective SVM probabilistic model (ONSET vs SILENCE)
+
+    # Step 3: compute onset probability based on the trained SVM
+    ProbOnset = []
+    for i in range(ShortTermFeatures.shape[1]):                    # for each frame
+        curFV = (ShortTermFeatures[:, i] - MEANSS) / STDSS         # normalize feature vector
+        ProbOnset.append(SVM.predict_proba(curFV.reshape(1,-1))[0][1])           # get SVM probability (that it belongs to the ONSET class)
+    ProbOnset = numpy.array(ProbOnset)
+    ProbOnset = smoothMovingAvg(ProbOnset, smoothWindow / stStep)  # smooth probability
+
+    # Step 4A: detect onset frame indices:
+    ProbOnsetSorted = numpy.sort(ProbOnset)                        # find probability Threshold as a weighted average of top 10% and lower 10% of the values
+    Nt = ProbOnsetSorted.shape[0] / 10
+    T = (numpy.mean((1 - Weight) * ProbOnsetSorted[0:Nt]) + Weight * numpy.mean(ProbOnsetSorted[-Nt::]))
+
+    #Filtering speech segment with speech energy
+    thred_eng = E[int(len(E)*minPercent / 100)]
+    MaxIdx = numpy.where(ProbOnset > T)[0]                         # get the indices of the frames that satisfy the thresholding
+    for i, idx in enumerate(MaxIdx):
+        if EnergySt[idx] < thred_eng:
+            continue;
+        MaxIdx[0] = idx
+        break
+    return MaxIdx
 
 def silenceRemoval(x, Fs, stWin, stStep, smoothWindow=0.5, Weight=0.5, plot=False):
     '''
@@ -703,8 +768,20 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
         - LDAdim (opt)     LDA dimension (0 for no LDA)
         - PLOT     (opt)   0 for not plotting the results 1 for plottingy
     '''
+
     [Fs, x] = audioBasicIO.readAudioFile(fileName)
+
     x = audioBasicIO.stereo2mono(x)
+
+    # Find first speech segment.
+    if len(x) > Fs * 600:
+        segments = nonSilenceIdx(x[0:Fs*600], Fs, stWin, 0.050, smoothWindow=1.0, Weight=0.3, minPercent=1,plot=False)
+    else:
+        segments = nonSilenceIdx(x, Fs, stWin, 0.050, smoothWindow=1.0, Weight=0.3, minPercent=1,plot=False)
+
+    silence_st = 0
+    if len(segments) > 0:
+        silence_st = int(segments[0]*stWin/mtStep)
     Duration = len(x) / Fs
 
     [Classifier1, MEAN1, STD1, classNames1, mtWin1, mtStep1, stWin1, stStep1, computeBEAT1] = aT.loadKNNModel(os.path.join("data","knnSpeakerAll"))
@@ -753,7 +830,10 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
     for curMidIdx, midFeat in enumerate(MidTermFeaturesNorm.T):
         DistancesAll[curMidIdx] = numpy.sum(distance.cdist([midFeat], MidTermFeaturesNorm.T))
     MDistancesAll = numpy.mean(DistancesAll)
-    iNonOutLiers = numpy.nonzero(DistancesAll < 1.2 * MDistancesAll)[0]
+    NonOutlierThreshold = 1.2 * MDistancesAll
+    for i in range(silence_st):
+        DistancesAll[i] = NonOutlierThreshold*2 #make this value bigger than nonoutlier threshold
+    iNonOutLiers = numpy.nonzero(DistancesAll < NonOutlierThreshold)[0]
 
     # TODO: Combine energy threshold for outlier removal:
     #EnergyMin = numpy.min(MidTermFeatures[1,:])
@@ -901,9 +981,18 @@ def speakerDiarization(fileName, numOfSpeakers, mtSize=2.0, mtStep=0.2, stWin=0.
     cls = scipy.signal.medfilt(cls, 13)
     cls = scipy.signal.medfilt(cls, 11)
 
+    #make silence channel in speaker clusters.
+    for i, item in enumerate(cls):
+        if i < silence_st:
+            cls[i] = 0
+        else:
+            cls[i] += 1
+
     sil = silAll[imax]                                        # final sillouette
     classNames = ["speaker{0:d}".format(c) for c in range(nSpeakersFinal)];
 
+    #make silence channel label
+    classNames[0] = "silence"
 
     # load ground-truth if available
     gtFile = fileName.replace('.wav', '.segments');                            # open for annotated file
